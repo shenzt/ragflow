@@ -1,0 +1,500 @@
+stages:
+  - test
+  - release
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^\d+\.\d+\.\d+$/)'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DRAFT != "true" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\s*ci\s*(,|$)/'
+    - when: never
+
+.default_shell_runner:
+  tags:
+    - ragflow-test
+  interruptible: true
+
+ragflow_tests:
+  extends: .default_shell_runner
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^\d+\.\d+\.\d+$/)'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DRAFT != "true" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\s*ci\s*(,|$)/'
+    - when: never
+  script:
+    - |
+      set -euo pipefail
+
+      SUDO=""
+      if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+      fi
+
+      docker_cmd() {
+        if [[ -n "${SUDO}" ]]; then
+          ${SUDO} docker "$@"
+        else
+          docker "$@"
+        fi
+      }
+
+      compose_cmd() {
+        if [[ -n "${SUDO}" ]]; then
+          ${SUDO} docker compose "$@"
+        else
+          docker compose "$@"
+        fi
+      }
+
+      RUN_ID="${CI_PIPELINE_ID}"
+      ARTIFACTS_DIR="${CI_PROJECT_DIR}/ci-artifacts/${RUN_ID}"
+      mkdir -p "${ARTIFACTS_DIR}"
+
+      echo "Pipeline source: ${CI_PIPELINE_SOURCE}"
+      if [[ -n "${SUDO}" ]]; then
+        ${SUDO} chown -R "${USER}" "${CI_PROJECT_DIR}" || true
+      fi
+
+      uvx ruff check
+
+      uv sync --python 3.12 --group test --frozen
+      source .venv/bin/activate
+      python3 run_tests.py
+
+      if [[ "${CI_PIPELINE_SOURCE}" == "schedule" ]]; then
+        HTTP_API_TEST_LEVEL="p3"
+      else
+        HTTP_API_TEST_LEVEL="p2"
+      fi
+
+      RAGFLOW_IMAGE="infiniflow/ragflow:${RUN_ID}"
+      RAGFLOW_CONTAINER="${RUN_ID}-ragflow-cpu-1"
+
+      docker_cmd pull ubuntu:22.04
+      if [[ -n "${SUDO}" ]]; then
+        ${SUDO} env DOCKER_BUILDKIT=1 docker build \
+          --build-arg NEED_MIRROR=1 \
+          --build-arg HTTPS_PROXY="${HTTPS_PROXY:-}" \
+          --build-arg HTTP_PROXY="${HTTP_PROXY:-}" \
+          -f Dockerfile \
+          -t "${RAGFLOW_IMAGE}" .
+      else
+        DOCKER_BUILDKIT=1 docker build \
+          --build-arg NEED_MIRROR=1 \
+          --build-arg HTTPS_PROXY="${HTTPS_PROXY:-}" \
+          --build-arg HTTP_PROXY="${HTTP_PROXY:-}" \
+          -f Dockerfile \
+          -t "${RAGFLOW_IMAGE}" .
+      fi
+
+      RUNNER_NUM="${CI_CONCURRENT_ID:-1}"
+
+      ES_PORT=$((1200 + RUNNER_NUM * 10))
+      OS_PORT=$((1201 + RUNNER_NUM * 10))
+      INFINITY_THRIFT_PORT=$((23817 + RUNNER_NUM * 10))
+      INFINITY_HTTP_PORT=$((23820 + RUNNER_NUM * 10))
+      INFINITY_PSQL_PORT=$((5432 + RUNNER_NUM * 10))
+      EXPOSE_MYSQL_PORT=$((5455 + RUNNER_NUM * 10))
+      MINIO_PORT=$((9000 + RUNNER_NUM * 10))
+      MINIO_CONSOLE_PORT=$((9001 + RUNNER_NUM * 10))
+      REDIS_PORT=$((6379 + RUNNER_NUM * 10))
+      TEI_PORT=$((6380 + RUNNER_NUM * 10))
+      KIBANA_PORT=$((6601 + RUNNER_NUM * 10))
+      SVR_HTTP_PORT=$((9380 + RUNNER_NUM * 10))
+      ADMIN_SVR_HTTP_PORT=$((9381 + RUNNER_NUM * 10))
+      SVR_MCP_PORT=$((9382 + RUNNER_NUM * 10))
+      SANDBOX_EXECUTOR_MANAGER_PORT=$((9385 + RUNNER_NUM * 10))
+      SVR_WEB_HTTP_PORT=$((80 + RUNNER_NUM * 10))
+      SVR_WEB_HTTPS_PORT=$((443 + RUNNER_NUM * 10))
+
+      cp docker/.env docker/.env.gitlab-ci.bak
+      cp docker/entrypoint.sh docker/entrypoint.sh.gitlab-ci.bak
+
+      {
+        echo ""
+        echo "ES_PORT=${ES_PORT}"
+        echo "OS_PORT=${OS_PORT}"
+        echo "INFINITY_THRIFT_PORT=${INFINITY_THRIFT_PORT}"
+        echo "INFINITY_HTTP_PORT=${INFINITY_HTTP_PORT}"
+        echo "INFINITY_PSQL_PORT=${INFINITY_PSQL_PORT}"
+        echo "EXPOSE_MYSQL_PORT=${EXPOSE_MYSQL_PORT}"
+        echo "MINIO_PORT=${MINIO_PORT}"
+        echo "MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT}"
+        echo "REDIS_PORT=${REDIS_PORT}"
+        echo "TEI_PORT=${TEI_PORT}"
+        echo "KIBANA_PORT=${KIBANA_PORT}"
+        echo "SVR_HTTP_PORT=${SVR_HTTP_PORT}"
+        echo "ADMIN_SVR_HTTP_PORT=${ADMIN_SVR_HTTP_PORT}"
+        echo "SVR_MCP_PORT=${SVR_MCP_PORT}"
+        echo "SANDBOX_EXECUTOR_MANAGER_PORT=${SANDBOX_EXECUTOR_MANAGER_PORT}"
+        echo "SVR_WEB_HTTP_PORT=${SVR_WEB_HTTP_PORT}"
+        echo "SVR_WEB_HTTPS_PORT=${SVR_WEB_HTTPS_PORT}"
+        echo "COMPOSE_PROFILES=${COMPOSE_PROFILES:-},tei-cpu"
+        echo "TEI_MODEL=BAAI/bge-small-en-v1.5"
+        echo "RAGFLOW_IMAGE=${RAGFLOW_IMAGE}"
+      } >> docker/.env
+
+      HOST_ADDRESS="http://host.docker.internal:${SVR_HTTP_PORT}"
+
+      sed -i '/"\$PY" api\/ragflow_server.py \${INIT_SUPERUSER_ARGS} &/c\   echo "Ensuring coverage is installed..."\n      "\$PY" -m pip install coverage\n     export COVERAGE_FILE=/ragflow/logs/.coverage\n        echo "Starting ragflow_server with coverage..."\n        "\$PY" -m coverage run --source=./api/apps --omit="*/tests/*,*/migrations/*" -a api/ragflow_server.py ${INIT_SUPERUSER_ARGS} &' docker/entrypoint.sh
+
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" up -d
+      uv sync --python 3.12 --group test --frozen
+      uv pip install -e sdk/python
+
+      wait_service() {
+        local retries="${1:-120}"
+        for _ in $(seq 1 "${retries}"); do
+          if docker_cmd exec "${RAGFLOW_CONTAINER}" curl -s --connect-timeout 5 "${HOST_ADDRESS}/v1/system/ping" > /dev/null; then
+            return 0
+          fi
+          echo "Waiting for service to be available..."
+          sleep 5
+        done
+        return 1
+      }
+
+      wait_service
+
+      export http_proxy=""
+      export https_proxy=""
+      export no_proxy=""
+      export HTTP_PROXY=""
+      export HTTPS_PROXY=""
+      export NO_PROXY=""
+
+      source .venv/bin/activate
+      set -o pipefail
+      pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" --junitxml=pytest-es-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-es-sdk.xml test/testcases/test_sdk_api 2>&1 | tee es_sdk_test.log
+      pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" test/testcases/test_web_api 2>&1 | tee es_web_api_test.log
+      pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" test/testcases/test_http_api 2>&1 | tee es_http_api_test.log
+
+      TIMEOUT_BIN="timeout"
+      if ! command -v timeout >/dev/null 2>&1 && command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+      fi
+
+      run_cli_suite() {
+        local log_file="$1"
+        local engine_tag="$2"
+        : > "${log_file}"
+
+        local email="ci-${RUN_ID}-${engine_tag}@example.com"
+        local pass="ci-pass-${RUN_ID}-${engine_tag}"
+        local dataset="ci_dataset_${RUN_ID}_${engine_tag}"
+        local cli="python admin/client/ragflow_cli.py"
+        local error_re='Traceback|ModuleNotFoundError|ImportError|Parse error|Bad response|Fail to|code:\\s*[1-9]'
+
+        run_cli() {
+          local logfile="$1"
+          shift
+          local allow_re=""
+          if [[ "${1:-}" == "--allow" ]]; then
+            allow_re="$2"
+            shift 2
+          fi
+          local cmd_display="$*"
+          echo "===== $(date -u +"%Y-%m-%dT%H:%M:%SZ") CMD: ${cmd_display} =====" | tee -a "${logfile}"
+          local tmp_log
+          tmp_log="$(mktemp)"
+          set +e
+          "${TIMEOUT_BIN}" 180s "$@" 2>&1 | tee "${tmp_log}"
+          local status=${PIPESTATUS[0]}
+          set -e
+          cat "${tmp_log}" >> "${logfile}"
+          if grep -qiE "${error_re}" "${tmp_log}"; then
+            if [[ -n "${allow_re}" ]] && grep -qiE "${allow_re}" "${tmp_log}"; then
+              echo "Allowed CLI error markers in ${logfile}"
+              rm -f "${tmp_log}"
+              return 0
+            fi
+            echo "Detected CLI error markers in ${logfile}"
+            rm -f "${tmp_log}"
+            exit 1
+          fi
+          rm -f "${tmp_log}"
+          return "${status}"
+        }
+
+        set -a
+        source docker/.env
+        set +a
+
+        local user_host="host.docker.internal"
+        local user_port="${SVR_HTTP_PORT}"
+        local admin_host="${user_host}"
+        local admin_port="${ADMIN_SVR_HTTP_PORT}"
+
+        wait_service
+
+        local admin_ready=0
+        for _ in $(seq 1 30); do
+          if run_cli "${log_file}" ${cli} --type admin --host "${admin_host}" --port "${admin_port}" --username "admin@ragflow.io" --password "admin" command "ping"; then
+            admin_ready=1
+            break
+          fi
+          sleep 1
+        done
+        if [[ "${admin_ready}" -ne 1 ]]; then
+          echo "Admin service did not become ready"
+          exit 1
+        fi
+
+        run_cli "${log_file}" ${cli} --type admin --host "${admin_host}" --port "${admin_port}" --username "admin@ragflow.io" --password "admin" command "show version"
+        local allow_user_exists_re='already exists|already exist|duplicate|already.*registered|exist(s)?'
+        run_cli "${log_file}" --allow "${allow_user_exists_re}" ${cli} --type admin --host "${admin_host}" --port "${admin_port}" --username "admin@ragflow.io" --password "admin" command "create user '${email}' '${pass}'"
+
+        local user_ready=0
+        for _ in $(seq 1 30); do
+          if run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "ping"; then
+            user_ready=1
+            break
+          fi
+          sleep 1
+        done
+        if [[ "${user_ready}" -ne 1 ]]; then
+          echo "User service did not become ready"
+          exit 1
+        fi
+
+        run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "show version"
+        run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "create dataset '${dataset}' with embedding 'BAAI/bge-small-en-v1.5@Builtin' parser 'auto'"
+        run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "import 'test/benchmark/test_docs/Doc1.pdf,test/benchmark/test_docs/Doc2.pdf' into dataset '${dataset}'"
+        run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "parse dataset '${dataset}' sync"
+        run_cli "${log_file}" ${cli} --type user --host "${user_host}" --port "${user_port}" --username "${email}" --password "${pass}" command "Benchmark 16 100 search 'what are these documents about' on datasets '${dataset}'"
+      }
+
+      run_cli_suite es_cli_test.log es
+
+      PID="$(docker_cmd exec "${RAGFLOW_CONTAINER}" sh -lc 'ps aux | grep "ragflow_server.py" | grep -v grep | awk "{print \$2}" | head -n 1')"
+      if [[ -n "${PID}" ]]; then
+        echo "Sending SIGINT to ragflow_server.py (PID: ${PID})..."
+        docker_cmd exec "${RAGFLOW_CONTAINER}" kill -INT "${PID}"
+        sleep 10
+      else
+        echo "ragflow_server.py not found!"
+      fi
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" stop
+
+      if [[ -f docker/ragflow-logs/.coverage ]]; then
+        cp docker/ragflow-logs/.coverage .coverage
+        source .venv/bin/activate
+        {
+          echo "[paths]"
+          echo "source ="
+          echo "    ."
+          echo "    /ragflow"
+        } > .coveragerc
+        coverage xml -o coverage-es-server.xml
+        rm -f .coveragerc
+        rm -f docker/ragflow-logs/.coverage
+      else
+        echo ".coverage file not found!"
+      fi
+
+      if [[ -d docker/ragflow-logs ]]; then
+        cp -r docker/ragflow-logs "${ARTIFACTS_DIR}/ragflow-logs-es"
+        tail -n 200 docker/ragflow-logs/ragflow_server.log || true
+      fi
+      rm -rf docker/ragflow-logs || true
+
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" down -v || true
+      docker_cmd ps -a --filter "label=com.docker.compose.project=${RUN_ID}" -q | while read -r cid; do
+        if [[ -n "${cid}" ]]; then
+          docker_cmd rm -f "${cid}" || true
+        fi
+      done
+
+      if grep -q '^DOC_ENGINE=' docker/.env; then
+        sed -i 's/^DOC_ENGINE=.*/DOC_ENGINE=infinity/' docker/.env
+      else
+        echo 'DOC_ENGINE=infinity' >> docker/.env
+      fi
+
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" up -d
+      wait_service
+
+      DOC_ENGINE=infinity pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" --junitxml=pytest-infinity-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-infinity-sdk.xml test/testcases/test_sdk_api 2>&1 | tee infinity_sdk_test.log
+      DOC_ENGINE=infinity pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" test/testcases/test_web_api/test_api_app 2>&1 | tee infinity_web_api_test.log
+      DOC_ENGINE=infinity pytest -s --tb=short --level="${HTTP_API_TEST_LEVEL}" test/testcases/test_http_api 2>&1 | tee infinity_http_api_test.log
+
+      run_cli_suite infinity_cli_test.log infinity
+
+      PID="$(docker_cmd exec "${RAGFLOW_CONTAINER}" sh -lc 'ps aux | grep "ragflow_server.py" | grep -v grep | awk "{print \$2}" | head -n 1')"
+      if [[ -n "${PID}" ]]; then
+        echo "Sending SIGINT to ragflow_server.py (PID: ${PID})..."
+        docker_cmd exec "${RAGFLOW_CONTAINER}" kill -INT "${PID}"
+        sleep 10
+      else
+        echo "ragflow_server.py not found!"
+      fi
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" stop
+
+      if [[ -f docker/ragflow-logs/.coverage ]]; then
+        cp docker/ragflow-logs/.coverage .coverage
+        source .venv/bin/activate
+        {
+          echo "[paths]"
+          echo "source ="
+          echo "    ."
+          echo "    /ragflow"
+        } > .coveragerc
+        coverage xml -o coverage-infinity-server.xml
+        rm -f .coveragerc
+      else
+        echo ".coverage file not found!"
+      fi
+
+      if [[ -d docker/ragflow-logs ]]; then
+        cp -r docker/ragflow-logs "${ARTIFACTS_DIR}/ragflow-logs-infinity"
+        tail -n 200 docker/ragflow-logs/ragflow_server.log || true
+      fi
+      rm -rf docker/ragflow-logs || true
+
+      compose_cmd -f docker/docker-compose.yml -p "${RUN_ID}" down -v || true
+      docker_cmd ps -a --filter "label=com.docker.compose.project=${RUN_ID}" -q | while read -r cid; do
+        if [[ -n "${cid}" ]]; then
+          docker_cmd rm -f "${cid}" || true
+        fi
+      done
+      docker_cmd rmi -f "${RAGFLOW_IMAGE}" || true
+
+      if [[ -f docker/.env.gitlab-ci.bak ]]; then
+        mv -f docker/.env.gitlab-ci.bak docker/.env
+      fi
+      if [[ -f docker/entrypoint.sh.gitlab-ci.bak ]]; then
+        mv -f docker/entrypoint.sh.gitlab-ci.bak docker/entrypoint.sh
+      fi
+  after_script:
+    - |
+      set +e
+      SUDO=""
+      if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+      fi
+      if [[ -n "${SUDO}" ]]; then
+        ${SUDO} docker compose -f docker/docker-compose.yml -p "${CI_PIPELINE_ID}" down -v || true
+        ${SUDO} docker ps -a --filter "label=com.docker.compose.project=${CI_PIPELINE_ID}" -q | xargs -r ${SUDO} docker rm -f || true
+        ${SUDO} docker rmi -f "infiniflow/ragflow:${CI_PIPELINE_ID}" || true
+      else
+        docker compose -f docker/docker-compose.yml -p "${CI_PIPELINE_ID}" down -v || true
+        docker ps -a --filter "label=com.docker.compose.project=${CI_PIPELINE_ID}" -q | xargs -r docker rm -f || true
+        docker rmi -f "infiniflow/ragflow:${CI_PIPELINE_ID}" || true
+      fi
+      if [[ -f docker/.env.gitlab-ci.bak ]]; then
+        mv -f docker/.env.gitlab-ci.bak docker/.env
+      fi
+      if [[ -f docker/entrypoint.sh.gitlab-ci.bak ]]; then
+        mv -f docker/entrypoint.sh.gitlab-ci.bak docker/entrypoint.sh
+      fi
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - ci-artifacts/
+      - '*_test.log'
+      - 'coverage-*.xml'
+      - 'pytest-*.xml'
+    reports:
+      junit:
+        - pytest-es-sdk.xml
+        - pytest-infinity-sdk.xml
+
+release_nightly:
+  extends: .default_shell_runner
+  stage: release
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $NIGHTLY_RELEASE == "true"'
+    - when: never
+  script:
+    - |
+      set -euo pipefail
+
+      SUDO=""
+      if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+      fi
+
+      docker_cmd() {
+        if [[ -n "${SUDO}" ]]; then
+          ${SUDO} docker "$@"
+        else
+          docker "$@"
+        fi
+      }
+
+      RELEASE_TAG="nightly"
+      RELEASE_DATETIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      echo "Release ${RELEASE_TAG} created from ${CI_COMMIT_SHA} at ${RELEASE_DATETIME}" > release_body.md
+
+      if [[ -n "${GITLAB_PUSH_TOKEN:-}" ]]; then
+        git fetch --tags
+        git config user.name "gitlab-ci"
+        git config user.email "gitlab-ci@${CI_SERVER_HOST}"
+        git tag -f "${RELEASE_TAG}" "${CI_COMMIT_SHA}"
+        git remote set-url origin "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+        git push -f origin "refs/tags/${RELEASE_TAG}"
+      else
+        echo "GITLAB_PUSH_TOKEN is not set; skip updating nightly tag."
+      fi
+
+      if [[ -z "${DOCKERHUB_TOKEN:-}" ]]; then
+        echo "DOCKERHUB_TOKEN is required for release_nightly"
+        exit 1
+      fi
+      docker_cmd login --username "${DOCKERHUB_USERNAME:-infiniflow}" --password-stdin <<< "${DOCKERHUB_TOKEN}"
+      docker_cmd build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY="${HTTPS_PROXY:-}" --build-arg HTTP_PROXY="${HTTP_PROXY:-}" -t "infiniflow/ragflow:${RELEASE_TAG}" -f Dockerfile .
+      docker_cmd tag "infiniflow/ragflow:${RELEASE_TAG}" "infiniflow/ragflow:latest"
+      docker_cmd push "infiniflow/ragflow:${RELEASE_TAG}"
+      docker_cmd push "infiniflow/ragflow:latest"
+
+release_tag:
+  extends: .default_shell_runner
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - when: never
+  script:
+    - |
+      set -euo pipefail
+
+      SUDO=""
+      if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+      fi
+
+      docker_cmd() {
+        if [[ -n "${SUDO}" ]]; then
+          ${SUDO} docker "$@"
+        else
+          docker "$@"
+        fi
+      }
+
+      RELEASE_TAG="${CI_COMMIT_TAG}"
+      RELEASE_DATETIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      echo "Release ${RELEASE_TAG} created from ${CI_COMMIT_SHA} at ${RELEASE_DATETIME}" > release_body.md
+
+      if [[ -z "${DOCKERHUB_TOKEN:-}" ]]; then
+        echo "DOCKERHUB_TOKEN is required for release_tag"
+        exit 1
+      fi
+      docker_cmd login --username "${DOCKERHUB_USERNAME:-infiniflow}" --password-stdin <<< "${DOCKERHUB_TOKEN}"
+      docker_cmd build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY="${HTTPS_PROXY:-}" --build-arg HTTP_PROXY="${HTTP_PROXY:-}" -t "infiniflow/ragflow:${RELEASE_TAG}" -f Dockerfile .
+      docker_cmd tag "infiniflow/ragflow:${RELEASE_TAG}" "infiniflow/ragflow:latest"
+      docker_cmd push "infiniflow/ragflow:${RELEASE_TAG}"
+      docker_cmd push "infiniflow/ragflow:latest"
+
+      if [[ -z "${PYPI_API_TOKEN:-}" ]]; then
+        echo "PYPI_API_TOKEN is required for publishing sdk/cli on tag releases"
+        exit 1
+      fi
+
+      uv sync --python 3.12 --group test --frozen
+      source .venv/bin/activate
+      (cd sdk/python && uv build && uv publish --token "${PYPI_API_TOKEN}")
+      (cd admin/client && uv build && uv publish --token "${PYPI_API_TOKEN}")
